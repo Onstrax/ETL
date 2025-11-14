@@ -69,7 +69,7 @@ def dim_json(name: str, db: Session = Depends(get_db), format: str = "json"):
 def hecho_json(name: str, db: Session = Depends(get_db), format: str = "json"):
     table_map = {
         "salud_ambiental": models.Hecho_Salud_Ambiental,
-        "morbilidad": models.Hecho_Morbilidad,
+        "infeccioso": models.Hecho_Infeccioso,
     }
     model = table_map.get(name.lower())
     if not model:
@@ -79,10 +79,25 @@ def hecho_json(name: str, db: Session = Depends(get_db), format: str = "json"):
         return StreamingResponse(iter([to_csv(rows)]), media_type="text/csv")
     return rows
 
+# @app.get("/hecho/infeccioso")
+# def get_infeccioso(format: str = "json"):
+#     from app.db import SessionLocal
+#     from app import models
+#     session = SessionLocal()
+#     rows = session.query(models.Hecho_Infeccioso).all()
+#     data = [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows]
+#     if format == "csv":
+#         import io, csv
+#         output = io.StringIO()
+#         writer = csv.DictWriter(output, fieldnames=data[0].keys() if data else [])
+#         writer.writeheader(); writer.writerows(data)
+#         return Response(content=output.getvalue(), media_type="text/csv")
+    return data
+
 @app.get("/")
 def root():
     return {"ok": True, "endpoints": [
         "POST /etl/run",
         "GET /dim/{fecha|fuente|ubicacion|estacion|poblacion}?format=json|csv",
-        "GET /hecho/{salud_ambiental|morbilidad}?format=json|csv"
+        "GET /hecho/{salud_ambiental|infeccioso}?format=json|csv"
     ]}

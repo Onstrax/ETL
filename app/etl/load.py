@@ -63,93 +63,117 @@ def run_etl():
         return {"processed": 0, "message": "Sin cambios"}
 
     files_and_dfs = [(p, read_any(p)) for p, _ in to_process]
-    salud_ambiental, morbilidad = unify_all(files_and_dfs)
+    salud_ambiental, morbilidad, mortalidad = unify_all(files_and_dfs)
 
     with SessionLocal() as db:
-        # ----- FUENTES (según tu mapeo) -----
+        # FUENTES (igual)
         FUENTE_IDEAM    = {"entidad":"IDEAM",      "confiabilidad":"Oficial", "tipo_dato":"Sensor"}
         FUENTE_SISAIRE  = {"entidad":"SISAIRE",    "confiabilidad":"Oficial", "tipo_dato":"Sensor"}
         FUENTE_SALUD    = {"entidad":"SALUD_DATA", "confiabilidad":"Oficial", "tipo_dato":"Vigilancia"}
-
         for f in (FUENTE_IDEAM, FUENTE_SISAIRE, FUENTE_SALUD):
             upsert_dim_value(db, models.Dim_Fuente, f, {})
         db.commit()
 
         def id_fuente_from_tag(tag: str):
-            if tag == "IDEAM":
-                return fk_id(db, models.Dim_Fuente, FUENTE_IDEAM, "id_fuente")
-            if tag == "SISAIRE":
-                return fk_id(db, models.Dim_Fuente, FUENTE_SISAIRE, "id_fuente")
-            if tag == "SALUD_DATA":
-                return fk_id(db, models.Dim_Fuente, FUENTE_SALUD, "id_fuente")
-            return None
+            if tag == "IDEAM": return fk_id(db, models.Dim_Fuente, FUENTE_IDEAM, "id_fuente")
+            if tag == "SISAIRE": return fk_id(db, models.Dim_Fuente, FUENTE_SISAIRE, "id_fuente")
+            return fk_id(db, models.Dim_Fuente, FUENTE_SALUD, "id_fuente")
 
-        # ----- DIMENSIONES DESDE SALUD_AMBIENTAL -----
-        if not salud_ambiental.empty:
-            # Estacion
+        # DIMS desde SALUD_AMBIENTAL
+        if salud_ambiental is not None and not salud_ambiental.empty:
+            # Estación
             for name in salud_ambiental["nombre_estacion"].dropna().drop_duplicates().tolist():
-                upsert_dim_value(db, models.Dim_Estacion, {"nombre": name}, {})
-            # Ubicacion
-            for loc in salud_ambiental["localidad"].fillna(DEFAULT_LOCALIDAD).drop_duplicates().tolist():
-                upsert_dim_value(db, models.Dim_Ubicacion, {"localidad": loc}, {})
-            # Fecha
+                upsert_dim_value(db, models.Dim_Estacion, {"nombre": str(name).strip()}, {})
+
+            # Ubicación
+            for loc in salud_ambiental["localidad"].fillna("Bogota D C").drop_duplicates().tolist():
+                upsert_dim_value(db, models.Dim_Ubicacion, {"localidad": str(loc).strip()}, {})
+
+            # Fechas (todas las diarias detectadas en ambientales)
             fechas = pd.to_datetime(salud_ambiental["fecha"], errors="coerce")
-            df_fecha = pd.DataFrame({"fecha": fechas.dt.date,
-                                     "dia": fechas.dt.day,
-                                     "mes": fechas.dt.month,
-                                     "ano": fechas.dt.year}).dropna().drop_duplicates()
+            df_fecha = (
+                pd.DataFrame({
+                    "fecha": fechas.dt.date,
+                    "dia": fechas.dt.day,
+                    "mes": fechas.dt.month,
+                    "ano": fechas.dt.year
+                })
+                .dropna()
+                .drop_duplicates()
+            )
             for _, r in df_fecha.iterrows():
-                upsert_dim_value(db, models.Dim_Fecha,
-                                 {"fecha": r["fecha"]},
-                                 {"dia": int(r["dia"]), "mes": int(r["mes"]), "ano": int(r["ano"])})
+                upsert_dim_value(
+                    db, models.Dim_Fecha,
+                    {"fecha": r["fecha"]},
+                    {"dia": int(r["dia"]), "mes": int(r["mes"]), "ano": int(r["ano"])}
+                )
             db.commit()
 
-        # ----- DIMENSIONES DESDE MORBILIDAD -----
-        if morbilidad is not None and not morbilidad.empty:
-            # Fecha (años)
+        # DIMS desde MORBILIDAD
+        if not morbilidad.empty:
             fechas = pd.to_datetime(morbilidad["fecha"], errors="coerce")
-            df_fecha = pd.DataFrame({"fecha": fechas.dt.date,
-                                     "dia": fechas.dt.day,
-                                     "mes": fechas.dt.month,
-                                     "ano": fechas.dt.year}).dropna().drop_duplicates()
+            df_fecha = pd.DataFrame({"fecha": fechas.dt.date, "dia": fechas.dt.day, "mes": fechas.dt.month, "ano": fechas.dt.year}).dropna().drop_duplicates()
             for _, r in df_fecha.iterrows():
-                upsert_dim_value(db, models.Dim_Fecha,
-                                 {"fecha": r["fecha"]},
-                                 {"dia": int(r["dia"]), "mes": int(r["mes"]), "ano": int(r["ano"])})
-            # Ubicacion
-            for loc in morbilidad["localidad"].fillna(DEFAULT_LOCALIDAD).drop_duplicates().tolist():
+                upsert_dim_value(db, models.Dim_Fecha, {"fecha": r["fecha"]}, {"dia": int(r["dia"]), "mes": int(r["mes"]), "ano": int(r["ano"])})
+            for loc in morbilidad["localidad"].dropna().drop_duplicates().tolist():
                 upsert_dim_value(db, models.Dim_Ubicacion, {"localidad": loc}, {})
-            # Poblacion (neutra, viene en morbilidad std)
-            pops = morbilidad[["sexo","menor_5_anos","regimen_seguridad_social"]].drop_duplicates()
+            pops = morbilidad[["sexo","edad","regimen_seguridad_social"]].drop_duplicates()
             for _, r in pops.iterrows():
-                sexo = (str(r["sexo"]).lower().strip() if pd.notna(r["sexo"]) and str(r["sexo"]).strip() != "" else "no_aplica")
-                menor = (bool(r["menor_5_anos"]) if pd.notna(r["menor_5_anos"]) else False)
-                regimen = (str(r["regimen_seguridad_social"]).strip() if pd.notna(r["regimen_seguridad_social"]) and str(r["regimen_seguridad_social"]).strip() != "" else "NA")
                 upsert_dim_value(db, models.Dim_Poblacion, {
-                    "sexo": sexo,
-                    "menor_5_anos": menor,
-                    "regimen_seguridad_social": regimen
+                    "sexo": (str(r.get("sexo")).lower().strip() if pd.notna(r.get("sexo")) and str(r.get("sexo")).strip() != "" else "no_aplica"),
+                    "edad": (str(r.get("edad")).strip() if pd.notna(r.get("edad")) and str(r.get("edad")).strip() != "" else "Poblacion general"),
+                    "regimen_seguridad_social": (str(r.get("regimen_seguridad_social")).strip() if pd.notna(r.get("regimen_seguridad_social")) and str(r.get("regimen_seguridad_social")).strip() != "" else "NA")
                 }, {})
             db.commit()
 
-        # ----- Helpers IDs -----
+        # DIMS desde MORTALIDAD
+        if not mortalidad.empty:
+            fechas = pd.to_datetime(mortalidad["fecha"], errors="coerce")
+            df_fecha = pd.DataFrame({"fecha": fechas.dt.date, "dia": fechas.dt.day, "mes": fechas.dt.month, "ano": fechas.dt.year}).dropna().drop_duplicates()
+            for _, r in df_fecha.iterrows():
+                upsert_dim_value(db, models.Dim_Fecha, {"fecha": r["fecha"]}, {"dia": int(r["dia"]), "mes": int(r["mes"]), "ano": int(r["ano"])})
+            for loc in mortalidad["localidad"].dropna().drop_duplicates().tolist():
+                upsert_dim_value(db, models.Dim_Ubicacion, {"localidad": loc}, {})
+            pops = mortalidad[["sexo","edad","regimen_seguridad_social"]].drop_duplicates()
+            for _, r in pops.iterrows():
+                upsert_dim_value(db, models.Dim_Poblacion, {
+                    "sexo": (str(r.get("sexo")).lower().strip() if pd.notna(r.get("sexo")) and str(r.get("sexo")).strip() != "" else "no_aplica"),
+                    "edad": (str(r.get("edad")).strip() if pd.notna(r.get("edad")) and str(r.get("edad")).strip() != "" else "Poblacion general"),
+                    "regimen_seguridad_social": (str(r.get("regimen_seguridad_social")).strip() if pd.notna(r.get("regimen_seguridad_social")) and str(r.get("regimen_seguridad_social")).strip() != "" else "NA")
+                }, {})
+            db.commit()
+
+        # Helpers
         def id_fecha(d):   return fk_id(db, models.Dim_Fecha, {"fecha": pd.to_datetime(d).date()}, "id_fecha")
         def id_est(n):     return fk_id(db, models.Dim_Estacion, {"nombre": n}, "id_estacion")
         def id_loc(l):     return fk_id(db, models.Dim_Ubicacion, {"localidad": l}, "id_ubicacion")
-        def id_pob(sexo, menor, reg):
+        def id_pob(sexo, edad, reg):
             return fk_id(db, models.Dim_Poblacion, {
                 "sexo": (str(sexo).lower().strip() if pd.notna(sexo) and str(sexo).strip() != "" else "no_aplica"),
-                "menor_5_anos": bool(menor) if not pd.isna(menor) else False,
+                "edad": (str(edad).strip() if pd.notna(edad) and str(edad).strip() != "" else "Poblacion general"),
                 "regimen_seguridad_social": (str(reg).strip() if pd.notna(reg) and str(reg).strip() != "" else "NA")
             }, "id_poblacion")
 
-        # ----- Cargar HECHO_SALUD_AMBIENTAL (sin población) -----
-        if not salud_ambiental.empty:
+        # Hecho_Salud_Ambiental (sin cambios en lógica)
+
+        # Hecho_Salud_Ambiental
+        if salud_ambiental is not None and not salud_ambiental.empty:
+            # compactar por si acaso (misma clave → promediamos)
+            key_cols = ["fecha", "nombre_estacion", "localidad", "source"]
+            value_cols = [c for c in salud_ambiental.columns if c not in key_cols]
+            if value_cols:
+                salud_ambiental = (
+                    salud_ambiental
+                    .groupby(key_cols, dropna=False)[value_cols]
+                    .mean()
+                    .reset_index()
+                )
+
             for _, r in salud_ambiental.iterrows():
                 fecha_id = id_fecha(r["fecha"])
                 est_id   = id_est(r["nombre_estacion"])
-                loc_id   = id_loc(r["localidad"] if pd.notna(r["localidad"]) else DEFAULT_LOCALIDAD)
-                fuente_id= id_fuente_from_tag(r.get("source"))
+                loc_id   = id_loc(r["localidad"])
+                fuente_id= id_fuente_from_tag(str(r.get("source")))
 
                 key = {
                     "id_fecha": fecha_id,
@@ -157,36 +181,62 @@ def run_etl():
                     "id_ubicacion": loc_id,
                     "id_estacion": est_id,
                 }
-                obj = db.get(models.Hecho_Salud_Ambiental, key)
+
+                stmt = select(models.Hecho_Salud_Ambiental).filter_by(**key)
+                obj = db.execute(stmt).scalar_one_or_none()
                 if not obj:
                     obj = models.Hecho_Salud_Ambiental(**key)
                     db.add(obj)
 
-                for m in ["promedio_pm25","promedio_pm10","promedio_co","promedio_so2","promedio_o3",
-                          "promedio_temperatura","promedio_humedad","promedio_precipitacion",
-                          "promedio_velocidad_viento","promedio_direccion_viento"]:
+                for m in [
+                    "promedio_pm25","promedio_pm10","promedio_co","promedio_so2","promedio_o3",
+                    "promedio_temperatura","promedio_humedad","promedio_precipitacion",
+                    "promedio_velocidad_viento","promedio_direccion_viento"
+                ]:
                     if m in salud_ambiental.columns and pd.notna(r.get(m)):
                         setattr(obj, m, float(r[m]))
             db.commit()
 
-        # ----- Cargar HECHO_MORBILIDAD (conteo por año/localidad/población neutra) -----
-        if morbilidad is not None and not morbilidad.empty:
+        # Hecho_Infeccioso — MORBILIDAD (semanal)
+        if not morbilidad.empty:
             fuente_id = id_fuente_from_tag("SALUD_DATA")
-            for _, r in morbilidad.iterrows():
-                fecha_id = id_fecha(r["fecha"])
-                loc_id   = id_loc(r["localidad"] if pd.notna(r["localidad"]) else DEFAULT_LOCALIDAD)
-                pob_id   = id_pob(r.get("sexo"), r.get("menor_5_anos"), r.get("regimen_seguridad_social"))
-
-                key = {"id_fecha": fecha_id, "id_fuente": fuente_id, "id_ubicacion": loc_id, "id_poblacion": pob_id}
-                obj = db.get(models.Hecho_Morbilidad, key)
+            rows = morbilidad.copy()
+            for _, r in rows.iterrows():
+                key = {
+                    "id_fecha": id_fecha(r["fecha"]),
+                    "id_fuente": fuente_id,
+                    "id_ubicacion": id_loc(r["localidad"]),
+                    "id_poblacion": id_pob(r.get("sexo"), r.get("edad"), r.get("regimen_seguridad_social")),
+                }
+                stmt = select(models.Hecho_Infeccioso).filter_by(**key)
+                obj = db.execute(stmt).scalar_one_or_none()
                 if not obj:
-                    obj = models.Hecho_Morbilidad(**key)
+                    obj = models.Hecho_Infeccioso(**key)
                     db.add(obj)
+                v = r.get("casos_morbilidad_ira")
+                if pd.notna(v):
+                    obj.casos_morbilidad_ira = int(float(v))
+            db.commit()
 
-                if "casos_ira" in morbilidad.columns and pd.notna(r.get("casos_ira")):
-                    obj.casos_ira = int(r["casos_ira"])
-                if "casos_neumonia" in morbilidad.columns and pd.notna(r.get("casos_neumonia")):
-                    obj.casos_neumonia = int(r["casos_neumonia"])
+        # Hecho_Infeccioso — MORTALIDAD (anual)
+        if not mortalidad.empty:
+            fuente_id = id_fuente_from_tag("SALUD_DATA")
+            rows = mortalidad.copy()
+            for _, r in rows.iterrows():
+                key = {
+                    "id_fecha": id_fecha(r["fecha"]),
+                    "id_fuente": fuente_id,
+                    "id_ubicacion": id_loc(r["localidad"]),
+                    "id_poblacion": id_pob(r.get("sexo"), r.get("edad"), r.get("regimen_seguridad_social")),
+                }
+                stmt = select(models.Hecho_Infeccioso).filter_by(**key)
+                obj = db.execute(stmt).scalar_one_or_none()
+                if not obj:
+                    obj = models.Hecho_Infeccioso(**key)
+                    db.add(obj)
+                v = r.get("casos_mortalidad_ira")
+                if pd.notna(v):
+                    obj.casos_mortalidad_ira = int(float(v))
             db.commit()
 
         # Marcar archivos como procesados

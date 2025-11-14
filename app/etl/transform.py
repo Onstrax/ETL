@@ -1,11 +1,20 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import unicodedata
 
-DEFAULT_LOCALIDAD = "Bogotá D.C"
+DEFAULT_LOCALIDAD = "SIN_LOCALIDAD"
+DEFAULT_SEXO = "no_aplica"
+DEFAULT_REGIMEN = "NA"
 
 def _to_datetime_safe(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce")
+
+def _norm_txt(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.replace('"', '').str.replace("'", '').str.strip()
+    s = s.str.replace(r"\s+", " ", regex=True)
+    s = s.apply(lambda x: unicodedata.normalize("NFKD", x).encode("ascii","ignore").decode("ascii"))
+    return s
 
 # ---------------------------
 #  Sensores ambientales
@@ -31,30 +40,47 @@ def _standardize_env(df: pd.DataFrame, filename: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["fecha","nombre_estacion","localidad","source"])
 
     df["fecha"] = pd.to_datetime(
-        df["fechaobservacion"],
-        format="%Y %b %d %I:%M:%S %p",
-        errors="coerce"
+        df["fechaobservacion"], format="%Y %b %d %I:%M:%S %p", errors="coerce"
     ).dt.date
-    df["nombre_estacion"] = df["nombreestacion"].astype(str).str.strip()
+    df["nombre_estacion"] = df["nombreestacion"].astype(str).str.replace('"', '').str.strip()
     # Municipio como localidad si existe
     loc_col = "municipio" if "municipio" in df.columns else None
-    df["localidad"] = df[loc_col].astype(str).str.strip() if loc_col else DEFAULT_LOCALIDAD
+    df["localidad"] = (df["municipio"].astype(str).str.replace('"', '').str.strip() if "municipio" in df.columns else "Bogota D C")
     df["valor"] = pd.to_numeric(df["valorobservado"], errors="coerce")
 
     lower = filename.lower()
-    measure = None
-    if "precipit" in lower:
+    desc_col = None
+    for c in df.columns:
+        if c.lower() in ["descripcionsensor", "descripcion_sensor"]:
+            desc_col = c
+            break
+    sensor_txt = (df[desc_col].astype(str).str.lower() if desc_col else pd.Series("", index=df.index))
+
+    def _has(sub):
+        return sub in lower or sensor_txt.str.contains(sub, regex=False, na=False).any()
+
+    if _has("precipit"):
         measure = "promedio_precipitacion"
-    elif "temperatura" in lower:
+    elif _has("temperatura") or _has("temp aire"):
         measure = "promedio_temperatura"
-    elif "humedad" in lower:
+    elif _has("humedad"):
         measure = "promedio_humedad"
-    elif "velocidad" in lower:
+    elif _has("velocidad") and _has("viento"):
         measure = "promedio_velocidad_viento"
-    elif "direcci" in lower:
+    elif _has("direccion") and _has("viento"):
         measure = "promedio_direccion_viento"
     else:
-        return pd.DataFrame(columns=["fecha","nombre_estacion","localidad","source"])
+        # si no reconocemos, no descartes el archivo a ciegas: intenta inferir por unidad
+        um = None
+        for c in df.columns:
+            if c.lower() in ["unidadmedida", "unidad_medida"]:
+                um = df[c].astype(str).str.lower()
+                break
+        if um is not None and um.str.contains("mm", na=False).any():
+            measure = "promedio_precipitacion"
+        else:
+            # no pudimos clasificar: devolvemos vacío
+            return pd.DataFrame(columns=["fecha","nombre_estacion","localidad","source"])
 
     g = (df.dropna(subset=["fecha"])
            .groupby(["fecha","nombre_estacion","localidad"], dropna=False)["valor"]
@@ -167,29 +193,26 @@ def _standardize_osb_count(df: pd.DataFrame, filename: str) -> pd.DataFrame:
 
 def standardize_dispatch(df: pd.DataFrame, path: Path):
     name = path.name.lower()
-    if name.startswith("z "):                 # IDEAM
-        return _standardize_env(df, path.name), None
-    if name.startswith("reporte_sisaire_"):   # SISAIRE
-        return _standardize_sisaire(df, path.name), None
-    if name.startswith("osb_"):               # SALUD_DATA
-        return None, _standardize_osb_count(df, path.name)
-    return pd.DataFrame(), pd.DataFrame()
+    # ANTES: if name.startswith("z "):
+    if name.startswith("z"):  # no "z "
+        return _standardize_env(df, path.name), None, None
+    if name.startswith("reporte_sisaire_"):
+        return _standardize_sisaire(df, path.name), None, None
+    if name.startswith("osb_"):
+        if "canal_ira" in name:
+            return None, _standardize_osb_morbilidad(df, path.name), None
+        else:
+            return None, None, _standardize_osb_mortalidad(df, path.name)
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 def unify_all(files_and_dfs):
-    """Combina todas las piezas:
-       - Salud ambiental: merge por (fecha, estacion, localidad, source)
-       - Morbilidad: suma por (fecha, localidad) y conserva población neutra (no_aplica/NA/flag<5)
-    """
-    env_parts = []
-    morb_parts = []
+    env_parts, morb_parts, mort_parts = [], [], []
     for p, df in files_and_dfs:
-        env, morb = standardize_dispatch(df, p)
-        if env is not None and not env.empty:
-            env_parts.append(env)
-        if morb is not None and not morb.empty:
-            morb_parts.append(morb)
+        env, morb, mort = standardize_dispatch(df, p)
+        if env is not None and not env.empty:   env_parts.append(env)
+        if morb is not None and not morb.empty: morb_parts.append(morb)
+        if mort is not None and not mort.empty: mort_parts.append(mort)
 
-    # Ambientales: merge por keys + source (asignaremos fuente por fila en load)
     salud_ambiental = pd.DataFrame()
     if env_parts:
         salud_ambiental = env_parts[0]
@@ -198,20 +221,16 @@ def unify_all(files_and_dfs):
                 part, on=["fecha","nombre_estacion","localidad","source"], how="outer"
             )
 
-    # Morbilidad: unir neumonía + ira5años
-    morbilidad = pd.DataFrame()
-    if morb_parts:
-        morbilidad = morb_parts[0]
-        for part in morb_parts[1:]:
-            morbilidad = morbilidad.merge(
-                part, on=["fecha","localidad","sexo","menor_5_anos","regimen_seguridad_social"], how="outer"
-            )
-        # Sumar por año/localidad/población (casos_ira, casos_neumonia)
-        agg_cols = [c for c in ["casos_ira","casos_neumonia"] if c in morbilidad.columns]
-        morbilidad = (morbilidad
-                      .groupby(["fecha","localidad","sexo","menor_5_anos","regimen_seguridad_social"], dropna=False)[agg_cols]
-                      .sum(min_count=1)
-                      .reset_index())
+    morbilidad = pd.concat(morb_parts, ignore_index=True) if morb_parts else pd.DataFrame()
+    mortalidad = pd.concat(mort_parts, ignore_index=True) if mort_parts else pd.DataFrame()
+
+    # asegurar numéricos
+    if not morbilidad.empty and "casos_morbilidad_ira" in morbilidad:
+        morbilidad["casos_morbilidad_ira"] = pd.to_numeric(morbilidad["casos_morbilidad_ira"], errors="coerce")
+    if not mortalidad.empty and "casos_mortalidad_ira" in mortalidad:
+        mortalidad["casos_mortalidad_ira"] = pd.to_numeric(mortalidad["casos_mortalidad_ira"], errors="coerce")
+
+    return salud_ambiental, morbilidad, mortalidad
 
     # Enriquecer con d/m/a
     def enrich_date(df):
@@ -226,3 +245,71 @@ def unify_all(files_and_dfs):
     morbilidad = enrich_date(morbilidad)
 
     return salud_ambiental, morbilidad
+
+
+# ---------- MORBILIDAD SEMANAL ----------
+def _map_grupo_to_edad(s: pd.Series) -> pd.Series:
+    s = _norm_txt(s).str.lower()
+    return (s
+        .replace({
+            "ninos menores de 1 ano": "Menor 1 ano",
+            "ninos menores de 5 anos": "Menor 5 anos",
+            "mayores de 60 anos": "Mayor 60 anos",
+            "poblacion general": "Poblacion general"
+        })
+        .fillna("Poblacion general")
+    )
+
+def _standardize_osb_morbilidad(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().upper() for c in df.columns]
+    if not {"FECHA","GRUPO_ETARIO"}.issubset(df.columns):
+        return pd.DataFrame()
+
+    # FECHA dd/mm/YYYY
+    df["fecha"] = pd.to_datetime(df["FECHA"], format="%d/%m/%Y", errors="coerce").dt.date
+    df["edad"] = _map_grupo_to_edad(df["GRUPO_ETARIO"])
+
+    # medida: CASOS_2025 o INF_CASOS
+    casos_col = "CASOS_2025" if "CASOS_2025" in df.columns else ("INF_CASOS" if "INF_CASOS" in df.columns else None)
+    if casos_col is None:
+        return pd.DataFrame()
+    df["casos_morbilidad_ira"] = pd.to_numeric(df[casos_col], errors="coerce")
+
+    # placeholders
+    df["localidad"] = DEFAULT_LOCALIDAD
+    df["sexo"] = DEFAULT_SEXO
+    df["regimen_seguridad_social"] = DEFAULT_REGIMEN
+
+    out = df[["fecha","localidad","sexo","edad","regimen_seguridad_social","casos_morbilidad_ira"]].dropna(subset=["fecha","edad"])
+    # agrega por si vinieran duplicados
+    out = (out.groupby(["fecha","localidad","sexo","edad","regimen_seguridad_social"], dropna=False)["casos_morbilidad_ira"]
+           .sum(min_count=1).reset_index())
+    # enriquecer
+    dts = pd.to_datetime(out["fecha"], errors="coerce")
+    out["dia"] = dts.dt.day; out["mes"] = dts.dt.month; out["ano"] = dts.dt.year
+    return out
+
+# ---------- MORTALIDAD ANUAL ----------
+def _standardize_osb_mortalidad(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().upper() for c in df.columns]
+    needed = {"ANO","LOCALIDAD","SEXO","REGIMEN_SEGURIDAD_SOCIAL"}
+    if not needed.issubset(df.columns):
+        return pd.DataFrame()
+
+    df["fecha"] = pd.to_datetime(df["ANO"].astype(str) + "-01-01", errors="coerce").dt.date
+    df["localidad"] = _norm_txt(df["LOCALIDAD"])
+    # sexo normalizado básico
+    df["sexo"] = (df["SEXO"].astype(str).str.strip().str.lower()
+                  .map({"m":"masculino","masculino":"masculino","f":"femenino","femenino":"femenino"})
+                  .fillna(DEFAULT_SEXO))
+    df["regimen_seguridad_social"] = df["REGIMEN_SEGURIDAD_SOCIAL"].astype(str).str.strip()
+    df["edad"] = "Menor 5 anos"  # como pediste
+
+    g = (df.groupby(["fecha","localidad","sexo","edad","regimen_seguridad_social"], dropna=False)
+           .size().reset_index(name="casos_mortalidad_ira"))
+
+    dts = pd.to_datetime(g["fecha"], errors="coerce")
+    g["dia"] = dts.dt.day; g["mes"] = dts.dt.month; g["ano"] = dts.dt.year
+    return g

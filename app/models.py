@@ -8,12 +8,12 @@ from .db import Base
 # -------------------------
 class Dim_Poblacion(Base):
     __tablename__ = "Dim_Poblacion"
-    id_poblacion = Column(Integer, primary_key=True, autoincrement=True)
-    sexo = Column(String(20), nullable=False)  # 'masculino' | 'femenino'
-    menor_5_anos = Column(Boolean, nullable=False)
+    id_poblacion = Column(Integer, primary_key=True, autoincrement=True)  # SK
+    sexo = Column(String(20), nullable=False)  # 'masculino', 'femenino', 'no_aplica'
+    edad = Column(String(30), nullable=False)  # 'Menor 1 ano' | 'Menor 5 anos' | 'Mayor 60 anos' | 'Poblacion general'
     regimen_seguridad_social = Column(String(100), nullable=True)
     __table_args__ = (
-        UniqueConstraint("sexo", "menor_5_anos", "regimen_seguridad_social", name="uq_poblacion_bk"),
+        UniqueConstraint("sexo", "edad", "regimen_seguridad_social", name="uq_poblacion_bk"),
     )
 
 class Dim_Fecha(Base):
@@ -71,15 +71,15 @@ class Hecho_Salud_Ambiental(Base):
     promedio_velocidad_viento = Column(Float, nullable=True)
     promedio_direccion_viento = Column(Float, nullable=True)
 
-class Hecho_Morbilidad(Base):
-    __tablename__ = "Hecho_Morbilidad"
+class Hecho_Infeccioso(Base):
+    __tablename__ = "Hecho_Infeccioso"
 
-    # PK compuesta por FKs (no lleva estación)
-    id_fecha     = Column(Integer, ForeignKey("Dim_Fecha.id_fecha"), primary_key=True, nullable=False)
-    id_fuente    = Column(Integer, ForeignKey("Dim_Fuente.id_fuente"), primary_key=True, nullable=False)
+    # PK compuesta (igual que antes)
+    id_fecha     = Column(Integer, ForeignKey("Dim_Fecha.id_fecha"),         primary_key=True, nullable=False)
+    id_fuente    = Column(Integer, ForeignKey("Dim_Fuente.id_fuente"),       primary_key=True, nullable=False)
     id_ubicacion = Column(Integer, ForeignKey("Dim_Ubicacion.id_ubicacion"), primary_key=True, nullable=False)
     id_poblacion = Column(Integer, ForeignKey("Dim_Poblacion.id_poblacion"), primary_key=True, nullable=False)
 
-    # Medidas
-    casos_ira      = Column(Integer, nullable=True)
-    casos_neumonia = Column(Integer, nullable=True)
+    # Medidas nuevas
+    casos_morbilidad_ira = Column(Integer, nullable=True)  # osb semanal (conteos ya vienen)
+    casos_mortalidad_ira = Column(Integer, nullable=True)  # osb anual (conteo por filas)

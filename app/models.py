@@ -2,6 +2,7 @@ from sqlalchemy import (
     Column, Integer, Float, String, Boolean, Date, ForeignKey, UniqueConstraint
 )
 from .db import Base
+from sqlalchemy import Index
 
 # -------------------------
 # Dimensiones (SK autoincremental)
@@ -83,3 +84,12 @@ class Hecho_Infeccioso(Base):
     # Medidas nuevas
     casos_morbilidad_ira = Column(Integer, nullable=True)  # osb semanal (conteos ya vienen)
     casos_mortalidad_ira = Column(Integer, nullable=True)  # osb anual (conteo por filas)
+
+
+Index("ix_hsa_id_fecha",     Hecho_Salud_Ambiental.id_fecha)
+Index("ix_hsa_id_fuente",    Hecho_Salud_Ambiental.id_fuente)
+Index("ix_hsa_id_ubicacion", Hecho_Salud_Ambiental.id_ubicacion)
+Index("ix_hsa_id_estacion",  Hecho_Salud_Ambiental.id_estacion)
+
+# También útil para Dim_Fecha.fecha:
+Index("ix_dim_fecha_fecha", Dim_Fecha.fecha)

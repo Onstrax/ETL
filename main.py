@@ -1,13 +1,16 @@
 from fastapi import FastAPI, Depends, Response, Query, HTTPException
 from fastapi.responses import StreamingResponse, Response
-from typing import List
+from typing import List, Optional, Literal
+from math import log, exp, sqrt, isnan
+from statistics import median, mean
 import csv
 from io import StringIO
+import math
 
 from app.db import Base, engine, get_db, SessionLocal
 from app import models
 from sqlalchemy.orm import Session
-from sqlalchemy import select, text
+from sqlalchemy import select, text, func
 
 from app.etl.load import run_etl
 
@@ -187,3 +190,256 @@ def root():
         "GET /dim/{fecha|fuente|ubicacion|estacion|poblacion}?format=json|csv",
         "GET /hecho/{salud_ambiental|infeccioso}?format=json|csv"
     ]}
+
+def _percentile(values, q: float):
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    if q <= 0:
+        return vals[0]
+    if q >= 1:
+        return vals[-1]
+    pos = (len(vals) - 1) * q
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return vals[lo]
+    return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
+
+@app.get("/stats/or_pm25_morbilidad_u5_city_month")
+def or_pm25_morbilidad_u5_city_month(
+    year_from: int = Query(2020, ge=2000, le=2100),
+    year_to: int = Query(2024, ge=2000, le=2100),
+    source: Optional[Literal["IDEAM","SISAIRE","ALL"]] = Query("ALL", description="Fuente para PM2.5"),
+    exposure_cut: Literal["median","mean","percentile"] = Query("median"),
+    outcome_cut: Literal["median","mean","percentile","gt0"] = Query("median"),
+    exposure_q: float = Query(0.6, ge=0.0, le=1.0, description="Cuantil para exposure_cut=percentile"),
+    outcome_q: float = Query(0.6, ge=0.0, le=1.0, description="Cuantil para outcome_cut=percentile"),
+):
+    """
+    OR entre exposición alta a PM2.5 (mensual) y morbilidad IRA <5 alta (mensual).
+    Unidad: ciudad–mes, en el rango [year_from, year_to].
+    """
+    if year_to < year_from:
+        raise HTTPException(status_code=400, detail="year_to debe ser >= year_from")
+
+    s = SessionLocal()
+    try:
+        # ---------- PM2.5 mensual a nivel ciudad ----------
+        q_pm = (
+            s.query(
+                models.Dim_Fecha.ano.label("ano"),
+                models.Dim_Fecha.mes.label("mes"),
+                func.avg(models.Hecho_Salud_Ambiental.promedio_pm25).label("pm25_mean")
+            )
+            .join(models.Dim_Fecha, models.Dim_Fecha.id_fecha == models.Hecho_Salud_Ambiental.id_fecha)
+            .join(models.Dim_Fuente, models.Dim_Fuente.id_fuente == models.Hecho_Salud_Ambiental.id_fuente)
+            .filter(models.Dim_Fecha.ano.between(year_from, year_to))
+            .filter(models.Hecho_Salud_Ambiental.promedio_pm25.isnot(None))
+            .group_by(models.Dim_Fecha.ano, models.Dim_Fecha.mes)
+        )
+        if source in ("IDEAM", "SISAIRE"):
+            q_pm = q_pm.filter(models.Dim_Fuente.entidad == source)
+        pm_rows = q_pm.all()
+        pm_map = {(r.ano, r.mes): float(r.pm25_mean) for r in pm_rows if r.pm25_mean is not None}
+
+        # ---------- Morbilidad IRA <5 mensual a nivel ciudad ----------
+        m_rows = (
+            s.query(
+                models.Dim_Fecha.ano.label("ano"),
+                models.Dim_Fecha.mes.label("mes"),
+                func.sum(func.coalesce(models.Hecho_Infeccioso.casos_morbilidad_ira, 0)).label("ira_u5")
+            )
+            .join(models.Dim_Fecha, models.Dim_Fecha.id_fecha == models.Hecho_Infeccioso.id_fecha)
+            .join(models.Dim_Poblacion, models.Dim_Poblacion.id_poblacion == models.Hecho_Infeccioso.id_poblacion)
+            .filter(models.Dim_Poblacion.edad == "Menor 5 anos")
+            .filter(models.Dim_Fecha.ano.between(year_from, year_to))
+            .group_by(models.Dim_Fecha.ano, models.Dim_Fecha.mes)
+            .all()
+        )
+        mort_map = {(r.ano, r.mes): int(r.ira_u5 or 0) for r in m_rows}
+
+        # ---------- Unión por ciudad–mes ----------
+        keys = sorted(set(pm_map.keys()) & set(mort_map.keys()))
+        data = [{"ano": a, "mes": m, "pm25_mean": pm_map[(a,m)], "ira_u5": mort_map[(a,m)]} for (a,m) in keys]
+        if not data:
+            raise HTTPException(status_code=404, detail="No hay datos combinados ciudad–mes para el rango/fuente.")
+
+        pm_vals = [d["pm25_mean"] for d in data]
+        ira_vals = [d["ira_u5"] for d in data]
+
+        # ---------- Cortes ----------
+        if exposure_cut == "median":
+            cut_pm = median(pm_vals)
+        elif exposure_cut == "mean":
+            cut_pm = mean(pm_vals)
+        else:
+            cut_pm = _percentile(pm_vals, exposure_q)
+
+        if outcome_cut == "median":
+            cut_ira = median(ira_vals); ira_high = lambda v: v > cut_ira
+        elif outcome_cut == "mean":
+            cut_ira = mean(ira_vals);   ira_high = lambda v: v > cut_ira
+        elif outcome_cut == "percentile":
+            cut_ira = _percentile(ira_vals, outcome_q); ira_high = lambda v: v > cut_ira
+        else:  # gt0
+            cut_ira = 0.0;              ira_high = lambda v: v > 0
+
+        pm_high = lambda v: v > cut_pm
+
+        # ---------- Tabla 2x2 ----------
+        a = b = c = d = 0.0
+        months = []
+        for row in data:
+            e = pm_high(row["pm25_mean"])
+            o = ira_high(row["ira_u5"])
+            months.append({"ano": row["ano"], "mes": row["mes"], "pm25": row["pm25_mean"], "ira_u5": row["ira_u5"], "exp_high": int(e), "out_high": int(o)})
+            if e and o:          a += 1
+            elif e and not o:    b += 1
+            elif (not e) and o:  c += 1
+            else:                d += 1
+
+        haldane = (a==0 or b==0 or c==0 or d==0)
+        if haldane:
+            a += 0.5; b += 0.5; c += 0.5; d += 0.5
+
+        # ---------- OR, IC95%, Wald p ----------
+        OR = (a*d)/(b*c)
+        lnOR = math.log(OR)
+        SE = math.sqrt(1.0/a + 1.0/b + 1.0/c + 1.0/d)
+        ci_low  = math.exp(lnOR - 1.96*SE)
+        ci_high = math.exp(lnOR + 1.96*SE)
+        z = lnOR/SE if SE > 0 else float("nan")
+        phi = lambda z: 0.5 * (1 + math.erf(z / math.sqrt(2)))
+        p = 2*(1 - phi(abs(z))) if SE > 0 else None
+
+        return {
+            "params": {
+                "years": [year_from, year_to],
+                "source": source,
+                "exposure_cut": exposure_cut,
+                "outcome_cut": outcome_cut,
+                "exposure_q": exposure_q if exposure_cut=="percentile" else None,
+                "outcome_q": outcome_q if outcome_cut=="percentile" else None
+            },
+            "sample": {
+                "n_months": len(data),
+                "a": a, "b": b, "c": c, "d": d,
+                "haldane_anscombe_correction": haldane
+            },
+            "thresholds": {
+                "pm25_cut": cut_pm,
+                "ira_u5_cut": cut_ira
+            },
+            "results": {
+                "odds_ratio": OR,
+                "ci95_lower": ci_low,
+                "ci95_upper": ci_high,
+                "z_wald": z,
+                "p_value_two_tailed": p,
+                "reject_H0_at_alpha_0.05": (ci_low>1 or ci_high<1)
+            },
+            "unit": "city-month",
+            "months_preview": months[:12]  # primeros 12 para inspección rápida
+        }
+    finally:
+        s.close()
+
+@app.get("/stats/or_pm25_mortalidad_u5_city")
+def or_pm25_mortalidad_u5_city(
+    year_from: int = Query(2020),
+    year_to: int = Query(2024),
+    source: Optional[Literal["IDEAM","SISAIRE","ALL"]] = Query("ALL"),
+    exposure_cut: Literal["median","mean"] = Query("median"),
+    outcome_cut: Literal["median","mean","gt0"] = Query("median"),
+):
+    if year_to < year_from:
+        raise HTTPException(status_code=400, detail="year_to debe ser >= year_from")
+
+    s = SessionLocal()
+    try:
+        # PM2.5 promedio anual a nivel ciudad
+        q_pm = (
+            s.query(
+                models.Dim_Fecha.ano.label("ano"),
+                func.avg(models.Hecho_Salud_Ambiental.promedio_pm25).label("pm25_mean")
+            )
+            .join(models.Dim_Fecha, models.Dim_Fecha.id_fecha==models.Hecho_Salud_Ambiental.id_fecha)
+            .join(models.Dim_Fuente, models.Dim_Fuente.id_fuente==models.Hecho_Salud_Ambiental.id_fuente)
+            .filter(models.Dim_Fecha.ano.between(year_from, year_to))
+            .filter(models.Hecho_Salud_Ambiental.promedio_pm25.isnot(None))
+            .group_by(models.Dim_Fecha.ano)
+        )
+        if source in ("IDEAM","SISAIRE"):
+            q_pm = q_pm.filter(models.Dim_Fuente.entidad == source)
+        pm = {r.ano: float(r.pm25_mean) for r in q_pm.all() if r.pm25_mean is not None}
+
+        # Mortalidad IRA <5 a nivel ciudad
+        q_m = (
+            s.query(
+                models.Dim_Fecha.ano.label("ano"),
+                func.sum(func.coalesce(models.Hecho_Infeccioso.casos_mortalidad_ira,0)).label("mort_ira_u5")
+            )
+            .join(models.Dim_Fecha, models.Dim_Fecha.id_fecha==models.Hecho_Infeccioso.id_fecha)
+            .join(models.Dim_Poblacion, models.Dim_Poblacion.id_poblacion==models.Hecho_Infeccioso.id_poblacion)
+            .filter(models.Dim_Poblacion.edad=="Menor 5 anos")
+            .filter(models.Dim_Fecha.ano.between(year_from, year_to))
+            .group_by(models.Dim_Fecha.ano)
+        )
+        mort = {r.ano: int(r.mort_ira_u5 or 0) for r in q_m.all()}
+
+        years = sorted(set(pm.keys()) & set(mort.keys()))
+        data = [{"ano": y, "pm25_mean": pm[y], "mort_ira_u5": mort[y]} for y in years]
+        if not data:
+            raise HTTPException(status_code=404, detail="No hay datos combinados a nivel ciudad para el rango dado.")
+
+        pm_vals = [d["pm25_mean"] for d in data]
+        mort_vals = [d["mort_ira_u5"] for d in data]
+
+        cut_pm = median(pm_vals) if exposure_cut=="median" else mean(pm_vals)
+        if outcome_cut == "median":
+            cut_m = median(mort_vals); mort_high = lambda v: v > cut_m
+        elif outcome_cut == "mean":
+            cut_m = mean(mort_vals);   mort_high = lambda v: v > cut_m
+        else:
+            cut_m = 0.0;               mort_high = lambda v: v > 0
+        pm_high = lambda v: v > cut_pm
+
+        a=b=c=d=0.0
+        for row in data:
+            e = pm_high(row["pm25_mean"])
+            o = mort_high(row["mort_ira_u5"])
+            if e and o:          a += 1
+            elif e and not o:    b += 1
+            elif (not e) and o:  c += 1
+            else:                d += 1
+
+        haldane = (a==0 or b==0 or c==0 or d==0)
+        if haldane:
+            a+=0.5; b+=0.5; c+=0.5; d+=0.5
+
+        OR = (a*d)/(b*c)
+        lnOR = math.log(OR)
+        SE = math.sqrt(1.0/a + 1.0/b + 1.0/c + 1.0/d)
+        ci_low  = math.exp(lnOR - 1.96*SE)
+        ci_high = math.exp(lnOR + 1.96*SE)
+        z = lnOR/SE if SE>0 else float("nan")
+        phi = lambda z: 0.5 * (1 + math.erf(z/math.sqrt(2)))
+        p = 2*(1 - phi(abs(z))) if SE>0 else None
+
+        return {
+            "params": {"years":[year_from,year_to], "source":source, "exposure_cut":exposure_cut, "outcome_cut":outcome_cut},
+            "sample": {"n_years": len(data), "years_included": years, "a": a, "b": b, "c": c, "d": d, "haldane": haldane},
+            "thresholds": {"pm25_cut": cut_pm, "mortality_cut": cut_m},
+            "results": {
+                "odds_ratio": OR,
+                "ci95_lower": ci_low,
+                "ci95_upper": ci_high,
+                "z_wald": z,
+                "p_value_two_tailed": p,
+                "reject_H0_at_alpha_0.05": (ci_low>1 or ci_high<1)
+            },
+            "note": "Unidad: ciudad-año (agregación de todas las localidades)."
+        }
+    finally:
+        s.close()
